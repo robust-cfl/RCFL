@@ -91,7 +91,7 @@ def print_model(D):
 if __name__ == '__main__':
     args = parse_args()
     if args.wandb:
-        wandb.init(entity='tdye24', project='RobustCFL')
+        wandb.init(entity='xxx', project='xxx')
         wandb.watch_called = False
         config = wandb.config
         config.update(args)
