@@ -1,0 +1,163 @@
+import torch
+import csv
+import sys
+import torch.nn as nn
+import torch.optim as optim
+from utils.utils import *
+from copy import deepcopy
+from opacus import PrivacyEngine
+from tqdm import tqdm
+from opacus.validators import ModuleValidator
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+class Client:
+    def __init__(self, train_loader, test_loader, model_class, hp, id_num):
+        self.id = id_num
+        # Belonging to which model.
+        self.model_index = -1
+        # Data_loaders
+        self.train_loader = train_loader
+        self.test_loader = test_loader
+        # Model
+        self.model = model_class().to(device)
+        # domain-classifier requires-grad False
+        for (key, param) in self.model.named_parameters():
+            if key.startswith('domain'):
+                param.requires_grad = False
+        if hp.dp:
+            self.model = ModuleValidator.fix(self.model)
+            ModuleValidator.validate(self.model, strict=False)
+        else:
+            pass
+
+        # fedavg domain-classifier用不到，塞到optimizer parameters中会导致这部分参数没有梯度，进而导致dp没法用，所以把这部分参数去掉
+
+        # Hyper-parameters
+        self.hp = hp
+        # Loss function
+        self.loss_fn = nn.CrossEntropyLoss()
+
+        self.start_point = None
+
+    @staticmethod
+    def model_difference(start_point, new_point):
+        loss = 0
+        old_params = start_point.state_dict()
+        for name, param in new_point.named_parameters():
+            loss += torch.norm(old_params[name] - param, 2)
+        return loss
+
+    def classify_training(self, lr):
+        model = self.model
+        model.train()
+        optimizer = optim.Adam(params=filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+        privacy_engine = None
+
+        loss_class = torch.nn.NLLLoss().cuda()
+        iterations = self.hp.classifyingEpoch
+
+        if self.hp.dp:
+            privacy_engine = PrivacyEngine()
+            model, optimizer, tmp_train_loader = privacy_engine.make_private(
+                module=model,
+                optimizer=optimizer,
+                data_loader=self.train_loader,
+                noise_multiplier=self.hp.sigma,
+                max_grad_norm=self.hp.max_per_sample_grad_norm,
+            )
+
+        else:
+            tmp_train_loader = self.train_loader
+        self.start_point = deepcopy(model)
+        for epoch in range(iterations):
+            len_dataloader = len(tmp_train_loader)
+            data_source_iter = iter(tmp_train_loader)
+            for i in range(len_dataloader):
+                optimizer.zero_grad()
+                # training model using source data
+                data_source = data_source_iter.next()
+                s_img, s_label = data_source
+                # move to gpu
+                s_img, s_label = s_img.cuda(), s_label.cuda()
+
+                class_output = model(input_data=s_img)
+                err_s_label = loss_class(class_output, s_label)
+                difference = self.model_difference(self.start_point, model)
+                loss = err_s_label + self.hp.proxyCoefficient * difference
+                loss.backward()
+                optimizer.step()
+
+                sys.stdout.write(
+                    '\r epoch: %d, [iter: %d / all %d], err_s_label: %f' \
+                    % (epoch, i + 1, len_dataloader, err_s_label.data.cpu().numpy()))
+                sys.stdout.flush()
+        if self.hp.dp:
+            epsilon, best_alpha = privacy_engine.accountant.get_privacy_spent(
+                delta=self.hp.delta
+            )
+            print(
+                # f"Train Epoch: {epoch} \t"
+                # f"Loss: {np.mean(losses):.6f} "
+                f"(ε = {epsilon:.2f}, δ = {self.hp.delta}) for α = {best_alpha}"
+            )
+
+            # summary = {
+            #     # 'Train/Loss': np.mean(losses),
+            #     'ε': epsilon,
+            #     'δ': self.hp.delta,
+            #     'α': best_alpha
+            # }
+            # print(summary)
+            # return deepcopy(model.state_dict()), epsilon
+        else:
+            # return deepcopy(model.state_dict())
+            pass
+
+    def update(self, parameters):
+        self.model.load_state_dict(parameters)
+
+    def validation(self, loader=None):
+        loss_class = torch.nn.NLLLoss().cuda()
+        loss_list = []
+        if loader is None:
+            loader = self.test_loader
+        alpha = 0
+        model = self.model
+        model.eval()
+
+        len_dataloader = len(loader)
+        data_iter = iter(loader)
+
+        i = 0
+        n_total = 0
+        n_correct = 0
+
+        while i < len_dataloader:
+            # test model using source/target data
+            data = data_iter.next()
+            img, label = data
+
+            batch_size = len(label)
+
+            img = img.cuda()
+            label = label.cuda()
+
+            class_output = model(input_data=img, alpha=alpha)
+            err = loss_class(class_output, label)
+            loss_list.append(err.item())
+            pred = class_output.data.max(1, keepdim=True)[1]
+            n_correct += pred.eq(label.data.view_as(pred)).cpu().sum()
+            n_total += batch_size
+
+            i += 1
+        acc = n_correct.data.numpy() * 1.0 / n_total
+        return {'loss': sum(loss_list) / len(loss_list), 'accuracy': acc}
+
+    def get_params(self):
+        return deepcopy(self.model.state_dict())
+
+    def set_params(self, model_params):
+        self.model.load_state_dict(model_params)
